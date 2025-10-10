@@ -454,30 +454,24 @@ vmfault(pagetable_t pagetable, uint64 va, int read)
   uint64 mem;
   struct proc *p = myproc();
   int i;
-
-  printf("DEBUG: vmfault called for va=0x%lx, process size=0x%lx\n", va, p->sz);
+  static uint64 seq = 0;
 
   if (va >= p->sz) {
-    printf("DEBUG: vmfault - va 0x%lx >= process size 0x%lx\n", va, p->sz);
     return 0;
   }
 
   va = PGROUNDDOWN(va);
 
   if(ismapped(pagetable, va)) {
-    printf("DEBUG: vmfault - va 0x%lx already mapped\n", va);
     return 0;
   }
 
   // Allocate physical page
   mem = (uint64) kalloc();
   if(mem == 0) {
-    printf("DEBUG: vmfault - kalloc failed\n");
     return 0;
   }
   memset((void *) mem, 0, PGSIZE);
-
-  printf("DEBUG: vmfault - allocating physical page for va=0x%lx\n", va);
 
   // Check if this page belongs to a program segment that needs to be loaded
   if(p->ip != 0 && p->phnum > 0) {
@@ -487,8 +481,8 @@ vmfault(pagetable_t pagetable, uint64 va, int read)
       uint64 seg_end = ph->vaddr + ph->memsz;
 
       if(va >= seg_start && va < seg_end) {
-        printf("DEBUG: vmfault - found segment for va=0x%lx in ELF segment [0x%lx-0x%lx]\n",
-               va, seg_start, seg_end);
+        // This is an executable segment
+        printf("exec\n"); // Complete the PAGEFAULT line
 
         // Calculate how much to read from file
         uint64 offset_in_seg = va - seg_start;
@@ -501,18 +495,18 @@ vmfault(pagetable_t pagetable, uint64 va, int read)
             bytes_to_read = ph->filesz - offset_in_seg;
           }
 
-          printf("DEBUG: vmfault - loading %ld bytes from file offset 0x%lx\n",
-                 bytes_to_read, file_offset);
-
           // Load data from executable file
           ilock(p->ip);
           if(readi(p->ip, 0, mem, file_offset, bytes_to_read) != bytes_to_read) {
             iunlock(p->ip);
             kfree((void *)mem);
-            printf("DEBUG: vmfault - readi failed\n");
             return 0;
           }
           iunlock(p->ip);
+
+          printf("[pid %d] LOADEXEC va=0x%lx\n", p->pid, va);
+        } else {
+          printf("[pid %d] ALLOC va=0x%lx\n", p->pid, va);
         }
 
         // Map the page with appropriate permissions
@@ -525,12 +519,10 @@ vmfault(pagetable_t pagetable, uint64 va, int read)
 
         if (mappages(p->pagetable, va, PGSIZE, mem, perm) != 0) {
           kfree((void *)mem);
-          printf("DEBUG: vmfault - mappages failed\n");
           return 0;
         }
 
-        printf("DEBUG: vmfault - successfully mapped va=0x%lx to pa=0x%lx with perm=0x%x\n",
-               va, mem, perm);
+        printf("[pid %d] RESIDENT va=0x%lx seq=%ld\n", p->pid, va, seq++);
 
         return mem;
       }
@@ -538,17 +530,24 @@ vmfault(pagetable_t pagetable, uint64 va, int read)
   }
 
   // Not a program segment - must be heap or stack
-  printf("DEBUG: vmfault - va=0x%lx not in any ELF segment, assuming heap/stack\n", va);
+  // Determine if it's heap or stack based on address
+  uint64 stack_bottom = p->sz - (USERSTACK+1)*PGSIZE;
+
+  if(va >= stack_bottom) {
+    printf("stack\n"); // Complete the PAGEFAULT line
+  } else {
+    printf("heap\n"); // Complete the PAGEFAULT line
+  }
+
+  printf("[pid %d] ALLOC va=0x%lx\n", p->pid, va);
 
   // Map with read/write permissions
   if (mappages(p->pagetable, va, PGSIZE, mem, PTE_W|PTE_U|PTE_R) != 0) {
     kfree((void *)mem);
-    printf("DEBUG: vmfault - mappages failed for heap/stack\n");
     return 0;
   }
 
-  printf("DEBUG: vmfault - successfully mapped va=0x%lx to pa=0x%lx with perm=0x%lx\n",
-         va, mem, PTE_W|PTE_U|PTE_R);
+  printf("[pid %d] RESIDENT va=0x%lx seq=%ld\n", p->pid, va, seq++);
 
   return mem;
 }

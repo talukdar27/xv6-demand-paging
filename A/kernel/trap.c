@@ -68,29 +68,24 @@ usertrap(void)
     syscall();
   } else if((which_dev = devintr()) != 0){
     // ok
-  } else if(r_scause() == 15 || r_scause() == 13) {
-    // page fault - load (13) or store (15)
-    printf("DEBUG: Page fault detected - scause=0x%lx, stval=0x%lx, epc=0x%lx\n",
-           r_scause(), r_stval(), r_sepc());
+  } else if(r_scause() == 15 || r_scause() == 13 || r_scause() == 12) {
+    // page fault - instruction (12), load (13), or store (15)
+    char *access_type;
+    if(r_scause() == 12)
+      access_type = "exec";
+    else if(r_scause() == 13)
+      access_type = "read";
+    else
+      access_type = "write";
+
+    // Determine cause - will be refined in vmfault
+    printf("[pid %d] PAGEFAULT va=0x%lx access=%s cause=",
+           p->pid, r_stval(), access_type);
+
     if(vmfault(p->pagetable, r_stval(), (r_scause() == 13)? 1 : 0) == 0) {
-      printf("DEBUG: vmfault failed\n");
       printf("usertrap(): unexpected scause 0x%lx pid=%d\n", r_scause(), p->pid);
       printf("            sepc=0x%lx stval=0x%lx\n", r_sepc(), r_stval());
       setkilled(p);
-    } else {
-      printf("DEBUG: Page fault handled successfully\n");
-    }
-  } else if(r_scause() == 12) {
-    // instruction page fault
-    printf("DEBUG: Page fault detected - scause=0x%lx, stval=0x%lx, epc=0x%lx\n",
-           r_scause(), r_stval(), r_sepc());
-    if(vmfault(p->pagetable, r_stval(), 0) == 0) {
-      printf("DEBUG: vmfault failed\n");
-      printf("usertrap(): unexpected scause 0x%lx pid=%d\n", r_scause(), p->pid);
-      printf("            sepc=0x%lx stval=0x%lx\n", r_sepc(), r_stval());
-      setkilled(p);
-    } else {
-      printf("DEBUG: Page fault handled successfully\n");
     }
   } else {
     printf("usertrap(): unexpected scause 0x%lx pid=%d\n", r_scause(), p->pid);

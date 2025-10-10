@@ -33,6 +33,7 @@ kexec(char *path, char **argv)
   struct proghdr ph;
   pagetable_t pagetable = 0, oldpagetable;
   struct proc *p = myproc();
+  uint64 text_start = 0, text_end = 0, data_start = 0, data_end = 0;
 
   printf("DEBUG: exec starting for %s\n", path);
 
@@ -76,6 +77,21 @@ kexec(char *path, char **argv)
     printf("DEBUG: exec segment at va=0x%lx size=0x%lx - NO physical allocation\n",
            ph.vaddr, ph.memsz);
 
+    // Track text and data segments for logging
+    if(ph.flags & 0x1) { // Executable - text segment
+      if(text_start == 0) {
+        text_start = ph.vaddr;
+        text_end = ph.vaddr + ph.memsz;
+      }
+    } else { // Data segment
+      if(data_start == 0 || ph.vaddr < data_start) {
+        data_start = ph.vaddr;
+        data_end = ph.vaddr + ph.memsz;
+      } else if(ph.vaddr + ph.memsz > data_end) {
+        data_end = ph.vaddr + ph.memsz;
+      }
+    }
+
     // Just calculate size, don't allocate or load
     if(ph.vaddr + ph.memsz > sz)
       sz = ph.vaddr + ph.memsz;
@@ -92,6 +108,7 @@ kexec(char *path, char **argv)
 
   // Allocate stack pages - MODIFIED: just update size
   sz = PGROUNDUP(sz);
+  uint64 heap_start = sz;
   sz += (USERSTACK+1)*PGSIZE;
   sp = sz;
   stackbase = sp - USERSTACK*PGSIZE;
@@ -127,6 +144,10 @@ kexec(char *path, char **argv)
   p->trapframe->epc = elf.entry;
   p->trapframe->sp = sp;
   proc_freepagetable(oldpagetable, oldsz);
+
+  // Mandatory logging format
+  printf("[pid %d] INIT-LAZYMAP text=[0x%lx,0x%lx) data=[0x%lx,0x%lx) heap_start=0x%lx stack_top=0x%lx\n",
+         p->pid, text_start, text_end, data_start, data_end, heap_start, sz);
 
   printf("DEBUG: exec completed for %s, entry point=0x%lx\n", path, elf.entry);
 
