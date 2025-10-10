@@ -57,8 +57,11 @@ sys_sbrk(void)
     // memory, vmfault() will allocate it.
     if(addr + n < addr)
       return -1;
+    printf("DEBUG: sbrk growing by %d bytes, old size=0x%lx new size=0x%lx (NO physical allocation)\n",
+           n, myproc()->sz, myproc()->sz + n);
     myproc()->sz += n;
   }
+  printf("DEBUG: sbrk returning address 0x%lx\n", addr);
   return addr;
 }
 

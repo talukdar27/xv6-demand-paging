@@ -47,10 +47,10 @@ usertrap(void)
   w_stvec((uint64)kernelvec);  //DOC: kernelvec
 
   struct proc *p = myproc();
-  
+
   // save user program counter.
   p->trapframe->epc = r_sepc();
-  
+
   if(r_scause() == 8){
     // system call
 
@@ -68,9 +68,30 @@ usertrap(void)
     syscall();
   } else if((which_dev = devintr()) != 0){
     // ok
-  } else if((r_scause() == 15 || r_scause() == 13) &&
-            vmfault(p->pagetable, r_stval(), (r_scause() == 13)? 1 : 0) != 0) {
-    // page fault on lazily-allocated page
+  } else if(r_scause() == 15 || r_scause() == 13) {
+    // page fault - load (13) or store (15)
+    printf("DEBUG: Page fault detected - scause=0x%lx, stval=0x%lx, epc=0x%lx\n",
+           r_scause(), r_stval(), r_sepc());
+    if(vmfault(p->pagetable, r_stval(), (r_scause() == 13)? 1 : 0) == 0) {
+      printf("DEBUG: vmfault failed\n");
+      printf("usertrap(): unexpected scause 0x%lx pid=%d\n", r_scause(), p->pid);
+      printf("            sepc=0x%lx stval=0x%lx\n", r_sepc(), r_stval());
+      setkilled(p);
+    } else {
+      printf("DEBUG: Page fault handled successfully\n");
+    }
+  } else if(r_scause() == 12) {
+    // instruction page fault
+    printf("DEBUG: Page fault detected - scause=0x%lx, stval=0x%lx, epc=0x%lx\n",
+           r_scause(), r_stval(), r_sepc());
+    if(vmfault(p->pagetable, r_stval(), 0) == 0) {
+      printf("DEBUG: vmfault failed\n");
+      printf("usertrap(): unexpected scause 0x%lx pid=%d\n", r_scause(), p->pid);
+      printf("            sepc=0x%lx stval=0x%lx\n", r_sepc(), r_stval());
+      setkilled(p);
+    } else {
+      printf("DEBUG: Page fault handled successfully\n");
+    }
   } else {
     printf("usertrap(): unexpected scause 0x%lx pid=%d\n", r_scause(), p->pid);
     printf("            sepc=0x%lx stval=0x%lx\n", r_sepc(), r_stval());
@@ -119,7 +140,7 @@ prepare_return(void)
 
   // set up the registers that trampoline.S's sret will use
   // to get to user space.
-  
+
   // set S Previous Privilege mode to User.
   unsigned long x = r_sstatus();
   x &= ~SSTATUS_SPP; // clear SPP to 0 for user mode
@@ -132,14 +153,14 @@ prepare_return(void)
 
 // interrupts and exceptions from kernel code go here via kernelvec,
 // on whatever the current kernel stack is.
-void 
+void
 kerneltrap()
 {
   int which_dev = 0;
   uint64 sepc = r_sepc();
   uint64 sstatus = r_sstatus();
   uint64 scause = r_scause();
-  
+
   if((sstatus & SSTATUS_SPP) == 0)
     panic("kerneltrap: not from supervisor mode");
   if(intr_get() != 0)

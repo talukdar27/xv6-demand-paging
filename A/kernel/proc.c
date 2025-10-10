@@ -33,7 +33,7 @@ void
 proc_mapstacks(pagetable_t kpgtbl)
 {
   struct proc *p;
-  
+
   for(p = proc; p < &proc[NPROC]; p++) {
     char *pa = kalloc();
     if(pa == 0)
@@ -48,7 +48,7 @@ void
 procinit(void)
 {
   struct proc *p;
-  
+
   initlock(&pid_lock, "nextpid");
   initlock(&wait_lock, "wait_lock");
   for(p = proc; p < &proc[NPROC]; p++) {
@@ -93,7 +93,7 @@ int
 allocpid()
 {
   int pid;
-  
+
   acquire(&pid_lock);
   pid = nextpid;
   nextpid = nextpid + 1;
@@ -169,6 +169,8 @@ freeproc(struct proc *p)
   p->killed = 0;
   p->xstate = 0;
   p->state = UNUSED;
+  p->ip = 0;  // Clear executable inode reference
+  p->phnum = 0;
 }
 
 // Create a user page table for a given process, with no user memory,
@@ -223,7 +225,7 @@ userinit(void)
 
   p = allocproc();
   initproc = p;
-  
+
   p->cwd = namei("/");
 
   p->state = RUNNABLE;
@@ -339,6 +341,13 @@ kexit(int status)
 
   begin_op();
   iput(p->cwd);
+
+  // Release the executable inode if we kept it for lazy loading
+  if(p->ip) {
+    iput(p->ip);  // Changed from iunlockput to iput
+    p->ip = 0;
+  }
+
   end_op();
   p->cwd = 0;
 
@@ -349,7 +358,7 @@ kexit(int status)
 
   // Parent might be sleeping in wait().
   wakeup(p->parent);
-  
+
   acquire(&p->lock);
 
   p->xstate = status;
@@ -405,7 +414,7 @@ kwait(uint64 addr)
       release(&wait_lock);
       return -1;
     }
-    
+
     // Wait for a child to exit.
     sleep(p, &wait_lock);  //DOC: wait-sleep
   }
@@ -540,7 +549,7 @@ void
 sleep(void *chan, struct spinlock *lk)
 {
   struct proc *p = myproc();
-  
+
   // Must acquire p->lock in order to
   // change p->state and then call sched.
   // Once we hold p->lock, we can be
@@ -619,7 +628,7 @@ int
 killed(struct proc *p)
 {
   int k;
-  
+
   acquire(&p->lock);
   k = p->killed;
   release(&p->lock);

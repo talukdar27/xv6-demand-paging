@@ -1,3 +1,5 @@
+#include "elf.h"
+
 // Saved registers for kernel context switches.
 struct context {
   uint64 ra;
@@ -104,4 +106,9 @@ struct proc {
   struct file *ofile[NOFILE];  // Open files
   struct inode *cwd;           // Current directory
   char name[16];               // Process name (debugging)
+
+  // For lazy loading of executable
+  struct inode *ip;            // Executable inode (for lazy loading)
+  struct proghdr ph[8];        // Program headers (for lazy loading)
+  int phnum;                   // Number of program headers
 };

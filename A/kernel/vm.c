@@ -1,7 +1,6 @@
 #include "param.h"
 #include "types.h"
 #include "memlayout.h"
-#include "elf.h"
 #include "riscv.h"
 #include "defs.h"
 #include "spinlock.h"
@@ -47,7 +46,7 @@ kvmmake(void)
 
   // allocate and map a kernel stack for each process.
   proc_mapstacks(kpgtbl);
-  
+
   return kpgtbl;
 }
 
@@ -156,7 +155,7 @@ mappages(pagetable_t pagetable, uint64 va, uint64 size, uint64 pa, int perm)
 
   if(size == 0)
     panic("mappages: size");
-  
+
   a = va;
   last = va + size - PGSIZE;
   for(;;){
@@ -200,7 +199,7 @@ uvmunmap(pagetable_t pagetable, uint64 va, uint64 npages, int do_free)
 
   for(a = va; a < va + npages*PGSIZE; a += PGSIZE){
     if((pte = walk(pagetable, a, 0)) == 0) // leaf page table entry allocated?
-      continue;   
+      continue;
     if((*pte & PTE_V) == 0)  // has physical page been allocated?
       continue;
     if(do_free){
@@ -329,7 +328,7 @@ void
 uvmclear(pagetable_t pagetable, uint64 va)
 {
   pte_t *pte;
-  
+
   pte = walk(pagetable, va, 0);
   if(pte == 0)
     panic("uvmclear");
@@ -349,7 +348,7 @@ copyout(pagetable_t pagetable, uint64 dstva, char *src, uint64 len)
     va0 = PGROUNDDOWN(dstva);
     if(va0 >= MAXVA)
       return -1;
-  
+
     pa0 = walkaddr(pagetable, va0);
     if(pa0 == 0) {
       if((pa0 = vmfault(pagetable, va0, 0)) == 0) {
@@ -361,7 +360,7 @@ copyout(pagetable_t pagetable, uint64 dstva, char *src, uint64 len)
     // forbid copyout over read-only user text pages.
     if((*pte & PTE_W) == 0)
       return -1;
-      
+
     n = PGSIZE - (dstva - va0);
     if(n > len)
       n = len;
@@ -446,7 +445,7 @@ copyinstr(pagetable_t pagetable, char *dst, uint64 srcva, uint64 max)
 }
 
 // allocate and map user memory if process is referencing a page
-// that was lazily allocated in sys_sbrk().
+// that was lazily allocated in sys_sbrk() or exec().
 // returns 0 if va is invalid or already mapped, or if
 // out of physical memory, and physical address if successful.
 uint64
@@ -454,21 +453,103 @@ vmfault(pagetable_t pagetable, uint64 va, int read)
 {
   uint64 mem;
   struct proc *p = myproc();
+  int i;
 
-  if (va >= p->sz)
-    return 0;
-  va = PGROUNDDOWN(va);
-  if(ismapped(pagetable, va)) {
+  printf("DEBUG: vmfault called for va=0x%lx, process size=0x%lx\n", va, p->sz);
+
+  if (va >= p->sz) {
+    printf("DEBUG: vmfault - va 0x%lx >= process size 0x%lx\n", va, p->sz);
     return 0;
   }
-  mem = (uint64) kalloc();
-  if(mem == 0)
+
+  va = PGROUNDDOWN(va);
+
+  if(ismapped(pagetable, va)) {
+    printf("DEBUG: vmfault - va 0x%lx already mapped\n", va);
     return 0;
+  }
+
+  // Allocate physical page
+  mem = (uint64) kalloc();
+  if(mem == 0) {
+    printf("DEBUG: vmfault - kalloc failed\n");
+    return 0;
+  }
   memset((void *) mem, 0, PGSIZE);
+
+  printf("DEBUG: vmfault - allocating physical page for va=0x%lx\n", va);
+
+  // Check if this page belongs to a program segment that needs to be loaded
+  if(p->ip != 0 && p->phnum > 0) {
+    for(i = 0; i < p->phnum; i++) {
+      struct proghdr *ph = &p->ph[i];
+      uint64 seg_start = ph->vaddr;
+      uint64 seg_end = ph->vaddr + ph->memsz;
+
+      if(va >= seg_start && va < seg_end) {
+        printf("DEBUG: vmfault - found segment for va=0x%lx in ELF segment [0x%lx-0x%lx]\n",
+               va, seg_start, seg_end);
+
+        // Calculate how much to read from file
+        uint64 offset_in_seg = va - seg_start;
+        uint64 file_offset = ph->off + offset_in_seg;
+        uint64 bytes_to_read = PGSIZE;
+
+        // Don't read beyond filesz (the rest is BSS, already zeroed)
+        if(offset_in_seg < ph->filesz) {
+          if(offset_in_seg + PGSIZE > ph->filesz) {
+            bytes_to_read = ph->filesz - offset_in_seg;
+          }
+
+          printf("DEBUG: vmfault - loading %ld bytes from file offset 0x%lx\n",
+                 bytes_to_read, file_offset);
+
+          // Load data from executable file
+          ilock(p->ip);
+          if(readi(p->ip, 0, mem, file_offset, bytes_to_read) != bytes_to_read) {
+            iunlock(p->ip);
+            kfree((void *)mem);
+            printf("DEBUG: vmfault - readi failed\n");
+            return 0;
+          }
+          iunlock(p->ip);
+        }
+
+        // Map the page with appropriate permissions
+        int perm = PTE_U;
+        if(ph->flags & 0x2) // PF_W
+          perm |= PTE_W;
+        if(ph->flags & 0x1) // PF_X
+          perm |= PTE_X;
+        perm |= PTE_R; // Always readable
+
+        if (mappages(p->pagetable, va, PGSIZE, mem, perm) != 0) {
+          kfree((void *)mem);
+          printf("DEBUG: vmfault - mappages failed\n");
+          return 0;
+        }
+
+        printf("DEBUG: vmfault - successfully mapped va=0x%lx to pa=0x%lx with perm=0x%x\n",
+               va, mem, perm);
+
+        return mem;
+      }
+    }
+  }
+
+  // Not a program segment - must be heap or stack
+  printf("DEBUG: vmfault - va=0x%lx not in any ELF segment, assuming heap/stack\n", va);
+
+  // Map with read/write permissions
   if (mappages(p->pagetable, va, PGSIZE, mem, PTE_W|PTE_U|PTE_R) != 0) {
     kfree((void *)mem);
+    printf("DEBUG: vmfault - mappages failed for heap/stack\n");
     return 0;
   }
+
+  printf("DEBUG: vmfault - successfully mapped va=0x%lx to pa=0x%lx with perm=0x%lx\n",
+         va, mem, PTE_W|PTE_U|PTE_R);
+
   return mem;
 }
 
