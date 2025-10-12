@@ -457,18 +457,28 @@ vmfault(pagetable_t pagetable, uint64 va, int read)
   static uint64 seq = 0;
 
   if (va >= p->sz) {
+    printf("vmfault: va 0x%lx >= process size 0x%lx (out of bounds)\n", va, p->sz);
     return 0;
   }
 
   va = PGROUNDDOWN(va);
 
+  // If already mapped, just return the physical address
+  // This handles spurious/double faults gracefully
   if(ismapped(pagetable, va)) {
+    uint64 pa = walkaddr(pagetable, va);
+    if(pa != 0) {
+      return pa;
+    }
+    // If walkaddr failed despite ismapped returning true, something is wrong
+    printf("vmfault: va 0x%lx marked as mapped but walkaddr failed\n", va);
     return 0;
   }
 
   // Allocate physical page
   mem = (uint64) kalloc();
   if(mem == 0) {
+    printf("vmfault: out of physical memory\n");
     return 0;
   }
   memset((void *) mem, 0, PGSIZE);
@@ -500,6 +510,7 @@ vmfault(pagetable_t pagetable, uint64 va, int read)
           if(readi(p->ip, 0, mem, file_offset, bytes_to_read) != bytes_to_read) {
             iunlock(p->ip);
             kfree((void *)mem);
+            printf("vmfault: failed to read from executable file\n");
             return 0;
           }
           iunlock(p->ip);
@@ -519,6 +530,7 @@ vmfault(pagetable_t pagetable, uint64 va, int read)
 
         if (mappages(p->pagetable, va, PGSIZE, mem, perm) != 0) {
           kfree((void *)mem);
+          printf("vmfault: mappages failed for exec segment\n");
           return 0;
         }
 
@@ -530,20 +542,48 @@ vmfault(pagetable_t pagetable, uint64 va, int read)
   }
 
   // Not a program segment - must be heap or stack
-  // Determine if it's heap or stack based on address
   uint64 stack_bottom = p->sz - (USERSTACK+1)*PGSIZE;
+  uint64 current_sp = p->trapframe->sp;
 
-  if(va >= stack_bottom) {
-    printf("stack\n"); // Complete the PAGEFAULT line
-  } else {
-    printf("heap\n"); // Complete the PAGEFAULT line
+  // Check if it's a valid stack access
+  // Stack grows downward, so valid access is:
+  // 1. Within the stack region (>= stack_bottom)
+  // 2. Within one page below the current stack pointer
+  if(va >= stack_bottom && va < p->sz) {
+    // It's in the stack region
+    uint64 sp_page = PGROUNDDOWN(current_sp);
+
+    // Allow if va is within one page below stack pointer
+    // This means: sp_page - PGSIZE <= va < sp_page + PGSIZE
+    if(va >= sp_page - PGSIZE && va < sp_page + PGSIZE) {
+      printf("stack\n"); // Complete the PAGEFAULT line
+      printf("[pid %d] ALLOC va=0x%lx\n", p->pid, va);
+
+      // Map with read/write permissions
+      if (mappages(p->pagetable, va, PGSIZE, mem, PTE_W|PTE_U|PTE_R) != 0) {
+        kfree((void *)mem);
+        printf("vmfault: mappages failed for stack\n");
+        return 0;
+      }
+
+      printf("[pid %d] RESIDENT va=0x%lx seq=%ld\n", p->pid, va, seq++);
+      return mem;
+    } else {
+      // In stack region but not within one page of SP - invalid
+      kfree((void *)mem);
+      printf("vmfault: stack access at va 0x%lx not within one page of SP (0x%lx)\n", va, current_sp);
+      return 0;
+    }
   }
 
+  // Must be heap
+  printf("heap\n"); // Complete the PAGEFAULT line
   printf("[pid %d] ALLOC va=0x%lx\n", p->pid, va);
 
   // Map with read/write permissions
   if (mappages(p->pagetable, va, PGSIZE, mem, PTE_W|PTE_U|PTE_R) != 0) {
     kfree((void *)mem);
+    printf("vmfault: mappages failed for heap\n");
     return 0;
   }
 

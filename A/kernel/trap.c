@@ -78,11 +78,13 @@ usertrap(void)
     else
       access_type = "write";
 
-    // Determine cause - will be refined in vmfault
+    // Print the beginning of the PAGEFAULT line
     printf("[pid %d] PAGEFAULT va=0x%lx access=%s cause=",
            p->pid, r_stval(), access_type);
 
     if(vmfault(p->pagetable, r_stval(), (r_scause() == 13)? 1 : 0) == 0) {
+      // vmfault failed - complete the log line with "invalid"
+      printf("invalid\n");
       printf("usertrap(): unexpected scause 0x%lx pid=%d\n", r_scause(), p->pid);
       printf("            sepc=0x%lx stval=0x%lx\n", r_sepc(), r_stval());
       setkilled(p);
