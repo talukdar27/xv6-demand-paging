@@ -2,9 +2,9 @@
 #include "types.h"
 #include "memlayout.h"
 #include "riscv.h"
-#include "defs.h"
 #include "spinlock.h"
 #include "proc.h"
+#include "defs.h"
 #include "fs.h"
 
 /*
@@ -444,6 +444,53 @@ copyinstr(pagetable_t pagetable, char *dst, uint64 srcva, uint64 max)
   }
 }
 
+// Helper function to find page info by VA
+struct page_info*
+find_page_info(struct proc *p, uint64 va)
+{
+  for(int i = 0; i < MAX_TRACKED_PAGES; i++) {
+    if(p->page_table[i].va == va) {
+      return &p->page_table[i];
+    }
+  }
+  return 0;
+}
+
+// Helper function to add page info
+struct page_info*
+add_page_info(struct proc *p, uint64 va)
+{
+  // Find empty slot
+  for(int i = 0; i < MAX_TRACKED_PAGES; i++) {
+    if(p->page_table[i].va == 0) {
+      p->page_table[i].va = va;
+      p->page_table[i].seq = p->next_fifo_seq++;
+      p->page_table[i].is_dirty = 0;
+      p->page_table[i].swap_slot = -1;
+      return &p->page_table[i];
+    }
+  }
+
+  // No empty slot found
+  printf("WARNING: No empty page_info slot found\n");
+  return 0;
+}
+
+// Helper function to remove page info
+void
+remove_page_info(struct proc *p, uint64 va)
+{
+  for(int i = 0; i < MAX_TRACKED_PAGES; i++) {
+    if(p->page_table[i].va == va) {
+      p->page_table[i].va = 0;
+      p->page_table[i].seq = 0;
+      p->page_table[i].is_dirty = 0;
+      p->page_table[i].swap_slot = -1;
+      return;
+    }
+  }
+}
+
 // allocate and map user memory if process is referencing a page
 // that was lazily allocated in sys_sbrk() or exec().
 // returns 0 if va is invalid or already mapped, or if
@@ -454,7 +501,7 @@ vmfault(pagetable_t pagetable, uint64 va, int read)
   uint64 mem;
   struct proc *p = myproc();
   int i;
-  static uint64 seq = 0;
+  struct page_info *pinfo;
 
   if (va >= p->sz) {
     printf("vmfault: va 0x%lx >= process size 0x%lx (out of bounds)\n", va, p->sz);
@@ -464,13 +511,11 @@ vmfault(pagetable_t pagetable, uint64 va, int read)
   va = PGROUNDDOWN(va);
 
   // If already mapped, just return the physical address
-  // This handles spurious/double faults gracefully
   if(ismapped(pagetable, va)) {
     uint64 pa = walkaddr(pagetable, va);
     if(pa != 0) {
       return pa;
     }
-    // If walkaddr failed despite ismapped returning true, something is wrong
     printf("vmfault: va 0x%lx marked as mapped but walkaddr failed\n", va);
     return 0;
   }
@@ -491,21 +536,17 @@ vmfault(pagetable_t pagetable, uint64 va, int read)
       uint64 seg_end = ph->vaddr + ph->memsz;
 
       if(va >= seg_start && va < seg_end) {
-        // This is an executable segment
-        printf("exec\n"); // Complete the PAGEFAULT line
+        printf("exec\n");
 
-        // Calculate how much to read from file
         uint64 offset_in_seg = va - seg_start;
         uint64 file_offset = ph->off + offset_in_seg;
         uint64 bytes_to_read = PGSIZE;
 
-        // Don't read beyond filesz (the rest is BSS, already zeroed)
         if(offset_in_seg < ph->filesz) {
           if(offset_in_seg + PGSIZE > ph->filesz) {
             bytes_to_read = ph->filesz - offset_in_seg;
           }
 
-          // Load data from executable file
           ilock(p->ip);
           if(readi(p->ip, 0, mem, file_offset, bytes_to_read) != bytes_to_read) {
             iunlock(p->ip);
@@ -520,13 +561,10 @@ vmfault(pagetable_t pagetable, uint64 va, int read)
           printf("[pid %d] ALLOC va=0x%lx\n", p->pid, va);
         }
 
-        // Map the page with appropriate permissions
         int perm = PTE_U;
-        if(ph->flags & 0x2) // PF_W
-          perm |= PTE_W;
-        if(ph->flags & 0x1) // PF_X
-          perm |= PTE_X;
-        perm |= PTE_R; // Always readable
+        if(ph->flags & 0x2) perm |= PTE_W;
+        if(ph->flags & 0x1) perm |= PTE_X;
+        perm |= PTE_R;
 
         if (mappages(p->pagetable, va, PGSIZE, mem, perm) != 0) {
           kfree((void *)mem);
@@ -534,7 +572,14 @@ vmfault(pagetable_t pagetable, uint64 va, int read)
           return 0;
         }
 
-        printf("[pid %d] RESIDENT va=0x%lx seq=%ld\n", p->pid, va, seq++);
+        clear_page_dirty(p, va);
+        p->num_resident_pages++;
+
+        // Add page info with sequence number
+        pinfo = add_page_info(p, va);
+        if(pinfo) {
+          printf("[pid %d] RESIDENT va=0x%lx seq=%d\n", p->pid, va, pinfo->seq);
+        }
 
         return mem;
       }
@@ -545,31 +590,30 @@ vmfault(pagetable_t pagetable, uint64 va, int read)
   uint64 stack_bottom = p->sz - (USERSTACK+1)*PGSIZE;
   uint64 current_sp = p->trapframe->sp;
 
-  // Check if it's a valid stack access
-  // Stack grows downward, so valid access is:
-  // 1. Within the stack region (>= stack_bottom)
-  // 2. Within one page below the current stack pointer
   if(va >= stack_bottom && va < p->sz) {
-    // It's in the stack region
     uint64 sp_page = PGROUNDDOWN(current_sp);
 
-    // Allow if va is within one page below stack pointer
-    // This means: sp_page - PGSIZE <= va < sp_page + PGSIZE
     if(va >= sp_page - PGSIZE && va < sp_page + PGSIZE) {
-      printf("stack\n"); // Complete the PAGEFAULT line
+      printf("stack\n");
       printf("[pid %d] ALLOC va=0x%lx\n", p->pid, va);
 
-      // Map with read/write permissions
       if (mappages(p->pagetable, va, PGSIZE, mem, PTE_W|PTE_U|PTE_R) != 0) {
         kfree((void *)mem);
         printf("vmfault: mappages failed for stack\n");
         return 0;
       }
 
-      printf("[pid %d] RESIDENT va=0x%lx seq=%ld\n", p->pid, va, seq++);
+      clear_page_dirty(p, va);
+      p->num_resident_pages++;
+
+      // Add page info with sequence number
+      pinfo = add_page_info(p, va);
+      if(pinfo) {
+        printf("[pid %d] RESIDENT va=0x%lx seq=%d\n", p->pid, va, pinfo->seq);
+      }
+
       return mem;
     } else {
-      // In stack region but not within one page of SP - invalid
       kfree((void *)mem);
       printf("vmfault: stack access at va 0x%lx not within one page of SP (0x%lx)\n", va, current_sp);
       return 0;
@@ -577,17 +621,23 @@ vmfault(pagetable_t pagetable, uint64 va, int read)
   }
 
   // Must be heap
-  printf("heap\n"); // Complete the PAGEFAULT line
+  printf("heap\n");
   printf("[pid %d] ALLOC va=0x%lx\n", p->pid, va);
 
-  // Map with read/write permissions
   if (mappages(p->pagetable, va, PGSIZE, mem, PTE_W|PTE_U|PTE_R) != 0) {
     kfree((void *)mem);
     printf("vmfault: mappages failed for heap\n");
     return 0;
   }
 
-  printf("[pid %d] RESIDENT va=0x%lx seq=%ld\n", p->pid, va, seq++);
+  clear_page_dirty(p, va);
+  p->num_resident_pages++;
+
+  // Add page info with sequence number
+  pinfo = add_page_info(p, va);
+  if(pinfo) {
+    printf("[pid %d] RESIDENT va=0x%lx seq=%d\n", p->pid, va, pinfo->seq);
+  }
 
   return mem;
 }
@@ -603,4 +653,59 @@ ismapped(pagetable_t pagetable, uint64 va)
     return 1;
   }
   return 0;
+}
+
+// Check if a page is dirty
+int
+is_page_dirty(struct proc *p, uint64 va)
+{
+  if(!p->dirty_pages || va >= p->max_dirty_pages * PGSIZE * 64)
+    return 0;
+
+  uint64 page_index = va / PGSIZE;
+  uint64 word_index = page_index / 64;
+  uint64 bit_index = page_index % 64;
+
+  return (p->dirty_pages[word_index] >> bit_index) & 1;
+}
+
+// Mark a page as dirty
+void
+mark_page_dirty(struct proc *p, uint64 va)
+{
+  // Allocate dirty bitmap if needed
+  if(!p->dirty_pages) {
+    // Enough for 128MB address space (32768 pages)
+    p->max_dirty_pages = 32768 / 64;
+    p->dirty_pages = (uint64*)kalloc();
+    if(p->dirty_pages)
+      memset(p->dirty_pages, 0, p->max_dirty_pages * sizeof(uint64));
+    else {
+      p->max_dirty_pages = 0;
+      return;
+    }
+  }
+
+  if(va >= p->max_dirty_pages * PGSIZE * 64)
+    return;
+
+  uint64 page_index = va / PGSIZE;
+  uint64 word_index = page_index / 64;
+  uint64 bit_index = page_index % 64;
+
+  p->dirty_pages[word_index] |= (1UL << bit_index);
+}
+
+// Clear dirty bit for a page
+void
+clear_page_dirty(struct proc *p, uint64 va)
+{
+  if(!p->dirty_pages || va >= p->max_dirty_pages * PGSIZE * 64)
+    return;
+
+  uint64 page_index = va / PGSIZE;
+  uint64 word_index = page_index / 64;
+  uint64 bit_index = page_index % 64;
+
+  p->dirty_pages[word_index] &= ~(1UL << bit_index);
 }

@@ -19,6 +19,7 @@ extern void forkret(void);
 static void freeproc(struct proc *p);
 
 extern char trampoline[]; // trampoline.S
+extern pagetable_t kernel_pagetable; // vm.c
 
 // helps ensure that wakeups of wait()ing
 // parents are not lost. helps obey the
@@ -146,6 +147,35 @@ found:
   p->context.ra = (uint64)forkret;
   p->context.sp = p->kstack + PGSIZE;
 
+  // Initialize demand paging fields
+  p->executable = 0;
+  p->num_segments = 0;
+  p->heap_start = 0;
+  p->stack_start = MAXVA;
+  p->next_fifo_seq = 1;
+  p->num_resident_pages = 0;
+
+  // Initialize lazy loading fields
+  p->ip = 0;
+  p->phnum = 0;
+
+  // Initialize dirty page tracking
+  p->dirty_pages = 0;
+  p->max_dirty_pages = 0;
+
+  // Initialize swap fields
+  p->num_swapped_pages = 0;
+  p->swap_fd = -1;
+  p->swap_filename[0] = '\0';
+
+  // Initialize page tracking table
+  for(int i = 0; i < MAX_TRACKED_PAGES; i++) {
+    p->page_table[i].va = 0;
+    p->page_table[i].seq = 0;
+    p->page_table[i].is_dirty = 0;
+    p->page_table[i].swap_slot = -1;
+  }
+
   return p;
 }
 
@@ -169,8 +199,23 @@ freeproc(struct proc *p)
   p->killed = 0;
   p->xstate = 0;
   p->state = UNUSED;
-  p->ip = 0;  // Clear executable inode reference
+
+  // Clear executable inode reference
+  p->ip = 0;
   p->phnum = 0;
+
+  // Free dirty pages bitmap
+  if(p->dirty_pages)
+    kfree((void*)p->dirty_pages);
+  p->dirty_pages = 0;
+  p->max_dirty_pages = 0;
+
+  // Reset memory tracking fields
+  p->next_fifo_seq = 0;
+  p->num_resident_pages = 0;
+  p->num_swapped_pages = 0;
+  p->swap_fd = -1;
+  p->swap_filename[0] = '\0';
 }
 
 // Create a user page table for a given process, with no user memory,

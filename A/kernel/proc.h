@@ -1,5 +1,28 @@
 #include "elf.h"
 
+#define MAX_TRACKED_PAGES 64
+
+struct page_info {
+  uint64 va;          // virtual address
+  int seq;            // sequence number for FIFO
+  int is_dirty;       // dirty bit
+  int swap_slot;      // swap slot number (-1 if not swapped)
+};
+
+// Add this struct definition to proc.h
+struct segment {
+  uint64 va;           // Virtual address start
+  uint64 size;         // Size in bytes
+  uint64 file_offset;  // Offset in executable file
+  uint64 file_size;    // Size of data in file
+  int flags;           // ELF flags (read/write/exec)
+};
+
+// Define ELF flags if not already defined
+// #define ELF_PROG_FLAG_EXEC    0x1
+// #define ELF_PROG_FLAG_WRITE   0x2
+// #define ELF_PROG_FLAG_READ    0x4
+
 // Saved registers for kernel context switches.
 struct context {
   uint64 ra;
@@ -107,8 +130,29 @@ struct proc {
   struct inode *cwd;           // Current directory
   char name[16];               // Process name (debugging)
 
-  // For lazy loading of executable
-  struct inode *ip;            // Executable inode (for lazy loading)
-  struct proghdr ph[8];        // Program headers (for lazy loading)
-  int phnum;                   // Number of program headers
+  // Add these new fields for demand paging:
+  struct inode *executable;    // Reference to executable file
+  struct segment segments[8];  // Program segments
+  int num_segments;           // Number of segments
+  uint64 heap_start;          // Start of heap
+  uint64 stack_start;         // Start of stack
+
+  // Add page tracking for FIFO/LRU
+  struct page_info page_table[MAX_TRACKED_PAGES];  // Page tracking table
+  int next_fifo_seq;          // Next FIFO sequence number
+  int num_resident_pages;     // Number of resident pages
+
+  // Add fields for lazy loading from executable
+  struct inode *ip;           // Inode of executable file
+  struct proghdr ph[8];       // Program headers from ELF
+  int phnum;                  // Number of program headers
+
+  // Add fields for dirty page tracking
+  uint64 *dirty_pages;        // Bitmap for dirty pages
+  int max_dirty_pages;        // Size of dirty pages bitmap
+
+  // Add fields for swap
+  int num_swapped_pages;      // Number of swapped pages
+  int swap_fd;                // File descriptor for swap file
+  char swap_filename[32];     // Swap file name
 };
