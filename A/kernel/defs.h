@@ -8,6 +8,7 @@ struct spinlock;
 struct sleeplock;
 struct stat;
 struct superblock;
+struct page_info;  // ADD THIS LINE
 
 // bio.c
 void            binit(void);
@@ -172,6 +173,10 @@ uint64          vmfault(pagetable_t, uint64, int);
 int             is_page_dirty(struct proc*, uint64);
 void            mark_page_dirty(struct proc*, uint64);
 void            clear_page_dirty(struct proc*, uint64);
+int             get_page_seq(struct proc*, uint64);
+struct page_info*   find_page_info(struct proc*, uint64);
+struct page_info*   add_page_info(struct proc*, uint64);
+void                remove_page_info(struct proc*, uint64);
 
 // plic.c
 void            plicinit(void);

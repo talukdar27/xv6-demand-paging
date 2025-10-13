@@ -351,7 +351,7 @@ copyout(pagetable_t pagetable, uint64 dstva, char *src, uint64 len)
 
     pa0 = walkaddr(pagetable, va0);
     if(pa0 == 0) {
-      if((pa0 = vmfault(pagetable, va0, 0)) == 0) {
+      if((pa0 = vmfault(pagetable, va0, 1)) == 0) {  // 1 = write access
         return -1;
       }
     }
@@ -385,7 +385,7 @@ copyin(pagetable_t pagetable, char *dst, uint64 srcva, uint64 len)
     va0 = PGROUNDDOWN(srcva);
     pa0 = walkaddr(pagetable, va0);
     if(pa0 == 0) {
-      if((pa0 = vmfault(pagetable, va0, 0)) == 0) {
+      if((pa0 = vmfault(pagetable, va0, 0)) == 0) {  // 0 = read access
         return -1;
       }
     }
@@ -491,12 +491,23 @@ remove_page_info(struct proc *p, uint64 va)
   }
 }
 
+// Get sequence number for a page
+int
+get_page_seq(struct proc *p, uint64 va)
+{
+  struct page_info *pinfo = find_page_info(p, va);
+  if(pinfo) {
+    return pinfo->seq;
+  }
+  return -1; // Page not found in tracking table
+}
+
 // allocate and map user memory if process is referencing a page
 // that was lazily allocated in sys_sbrk() or exec().
 // returns 0 if va is invalid or already mapped, or if
 // out of physical memory, and physical address if successful.
 uint64
-vmfault(pagetable_t pagetable, uint64 va, int read)
+vmfault(pagetable_t pagetable, uint64 va, int write_access)
 {
   uint64 mem;
   struct proc *p = myproc();
@@ -514,6 +525,14 @@ vmfault(pagetable_t pagetable, uint64 va, int read)
   if(ismapped(pagetable, va)) {
     uint64 pa = walkaddr(pagetable, va);
     if(pa != 0) {
+      // Mark page dirty if this is a write access
+      if(write_access) {
+        mark_page_dirty(p, va);
+        pinfo = find_page_info(p, va);
+        if(pinfo) {
+          pinfo->is_dirty = 1;
+        }
+      }
       return pa;
     }
     printf("vmfault: va 0x%lx marked as mapped but walkaddr failed\n", va);
@@ -578,6 +597,11 @@ vmfault(pagetable_t pagetable, uint64 va, int read)
         // Add page info with sequence number
         pinfo = add_page_info(p, va);
         if(pinfo) {
+          // Mark dirty if this is a write access
+          if(write_access) {
+            mark_page_dirty(p, va);
+            pinfo->is_dirty = 1;
+          }
           printf("[pid %d] RESIDENT va=0x%lx seq=%d\n", p->pid, va, pinfo->seq);
         }
 
@@ -609,6 +633,11 @@ vmfault(pagetable_t pagetable, uint64 va, int read)
       // Add page info with sequence number
       pinfo = add_page_info(p, va);
       if(pinfo) {
+        // Mark dirty if this is a write access
+        if(write_access) {
+          mark_page_dirty(p, va);
+          pinfo->is_dirty = 1;
+        }
         printf("[pid %d] RESIDENT va=0x%lx seq=%d\n", p->pid, va, pinfo->seq);
       }
 
@@ -636,6 +665,11 @@ vmfault(pagetable_t pagetable, uint64 va, int read)
   // Add page info with sequence number
   pinfo = add_page_info(p, va);
   if(pinfo) {
+    // Mark dirty if this is a write access
+    if(write_access) {
+      mark_page_dirty(p, va);
+      pinfo->is_dirty = 1;
+    }
     printf("[pid %d] RESIDENT va=0x%lx seq=%d\n", p->pid, va, pinfo->seq);
   }
 

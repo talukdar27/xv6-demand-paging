@@ -1,10 +1,10 @@
 #include "types.h"
-#include "riscv.h"
-#include "defs.h"
 #include "param.h"
 #include "memlayout.h"
+#include "riscv.h"
 #include "spinlock.h"
 #include "proc.h"
+#include "defs.h"
 #include "memstat.h"
 
 // Helper function to check if a page is resident
@@ -20,17 +20,11 @@ int
 get_swap_slot(struct proc *p, uint64 va)
 {
   // We'll implement this when we add swapping
+  struct page_info *pinfo = find_page_info(p, va);
+  if(pinfo) {
+    return pinfo->swap_slot;
+  }
   return -1; // -1 means not swapped
-}
-
-// Helper function to get sequence number for a page
-int
-get_page_seq(struct proc *p, uint64 va)
-{
-  // For now, we'll use a simple approach
-  // In a complete implementation, you'd track this per page
-  // This is a placeholder - you'll need to implement proper tracking
-  return 0;
 }
 
 uint64
@@ -63,7 +57,7 @@ sys_memstat(void)
       page->state = RESIDENT;
       info.num_resident_pages++;
       page->is_dirty = is_page_dirty(p, va);
-      page->seq = get_page_seq(p, va);  // You need to implement proper seq tracking
+      page->seq = get_page_seq(p, va);
     } else {
       int swap_slot = get_swap_slot(p, va);
       if(swap_slot >= 0) {
