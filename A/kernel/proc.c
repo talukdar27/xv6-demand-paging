@@ -164,9 +164,10 @@ found:
   p->max_dirty_pages = 0;
 
   // Initialize swap fields
-  p->num_swapped_pages = 0;
-  p->swap_fd = -1;
+  p->swap_ip = 0;
   p->swap_filename[0] = '\0';
+  memset(p->swap_slots, 0, sizeof(p->swap_slots));
+  p->num_swapped_pages = 0;
 
   // Initialize page tracking table
   for(int i = 0; i < MAX_TRACKED_PAGES; i++) {
@@ -210,12 +211,18 @@ freeproc(struct proc *p)
   p->dirty_pages = 0;
   p->max_dirty_pages = 0;
 
+  // Clean up swap file if it exists
+  if(p->swap_ip) {
+    iput(p->swap_ip);
+    p->swap_ip = 0;
+  }
+  p->swap_filename[0] = '\0';
+  memset(p->swap_slots, 0, sizeof(p->swap_slots));
+
   // Reset memory tracking fields
   p->next_fifo_seq = 0;
   p->num_resident_pages = 0;
   p->num_swapped_pages = 0;
-  p->swap_fd = -1;
-  p->swap_filename[0] = '\0';
 }
 
 // Create a user page table for a given process, with no user memory,
@@ -391,6 +398,31 @@ kexit(int status)
   if(p->ip) {
     iput(p->ip);  // Changed from iunlockput to iput
     p->ip = 0;
+  }
+
+  // Clean up swap file if it exists
+  if(p->swap_ip) {
+    // Count how many swap slots are used
+    int used_slots = 0;
+    for(int i = 0; i < 1024; i++) {
+      if(p->swap_slots[i] == 1) {
+        used_slots++;
+      }
+    }
+
+    printf("[pid %d] SWAPCLEANUP freed_slots=%d\n", p->pid, used_slots);
+
+    // Truncate the swap file to remove its contents
+    ilock(p->swap_ip);
+    itrunc(p->swap_ip);
+    iunlock(p->swap_ip);
+
+    // Release the inode
+    iput(p->swap_ip);
+    p->swap_ip = 0;
+
+    // Note: We don't call unlink here because we don't have that function
+    // The file will be cleaned up when the inode is freed
   }
 
   end_op();

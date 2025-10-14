@@ -55,6 +55,7 @@ void            stati(struct inode*, struct stat*);
 int             writei(struct inode*, int, uint64, uint, uint);
 void            itrunc(struct inode*);
 void            ireclaim(int);
+struct inode*   create(char*, short, short, short);
 
 // kalloc.c
 void*           kalloc(void);
@@ -177,6 +178,13 @@ int             get_page_seq(struct proc*, uint64);
 struct page_info*   find_page_info(struct proc*, uint64);
 struct page_info*   add_page_info(struct proc*, uint64);
 void                remove_page_info(struct proc*, uint64);
+struct page_info*   find_fifo_victim(struct proc*);
+int                 evict_page(struct proc*, struct page_info*);
+int                 write_to_swap(struct proc*, uint64);
+int                 read_from_swap(struct proc*, uint64, int);
+struct page_info*   find_swapped_page(struct proc*, uint64);
+void                free_swap_slot(struct proc*, int);
+int                 alloc_swap_slot(struct proc*);
 
 // plic.c
 void            plicinit(void);

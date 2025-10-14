@@ -5,6 +5,8 @@
 #include "spinlock.h"
 #include "proc.h"
 #include "defs.h"
+#include "stat.h"
+#include "fs.h"
 
 static int loadseg(pde_t *, uint64, struct inode *, uint, uint);
 
@@ -148,6 +150,49 @@ kexec(char *path, char **argv)
   // Mandatory logging format
   printf("[pid %d] INIT-LAZYMAP text=[0x%lx,0x%lx) data=[0x%lx,0x%lx) heap_start=0x%lx stack_top=0x%lx\n",
          p->pid, text_start, text_end, data_start, data_end, heap_start, sz);
+
+  // Create swap file for this process
+  // Format: /pgswp00001 (5 digits, zero-padded)
+  char swap_path[16];
+  int len = 0;
+  swap_path[len++] = '/';
+  swap_path[len++] = 'p';
+  swap_path[len++] = 'g';
+  swap_path[len++] = 's';
+  swap_path[len++] = 'w';
+  swap_path[len++] = 'p';
+
+  // Convert PID to 5-digit zero-padded string
+  int pid_copy = p->pid;
+  char digits[5];
+  for(int i = 4; i >= 0; i--) {
+    digits[i] = '0' + (pid_copy % 10);
+    pid_copy /= 10;
+  }
+  for(int i = 0; i < 5; i++) {
+    swap_path[len++] = digits[i];
+  }
+  swap_path[len] = '\0';
+
+  // Create the swap file
+  begin_op();
+  struct inode *swap_ip = create(swap_path, T_FILE, 0, 0);
+  if(swap_ip == 0) {
+    end_op();
+    printf("[pid %d] WARNING: Failed to create swap file %s\n", p->pid, swap_path);
+  } else {
+    // Store swap file info in process structure
+    p->swap_ip = swap_ip;
+    safestrcpy(p->swap_filename, swap_path, sizeof(p->swap_filename));
+    memset(p->swap_slots, 0, sizeof(p->swap_slots));
+    p->num_swapped_pages = 0;
+
+    // Keep the inode locked and referenced
+    iunlock(swap_ip);
+    end_op();
+
+    printf("[pid %d] Created swap file: %s\n", p->pid, swap_path);
+  }
 
   printf("DEBUG: exec completed for %s, entry point=0x%lx\n", path, elf.entry);
 

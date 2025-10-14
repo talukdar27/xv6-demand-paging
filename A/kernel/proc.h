@@ -152,7 +152,8 @@ struct proc {
   int max_dirty_pages;        // Size of dirty pages bitmap
 
   // Add fields for swap
+  struct inode *swap_ip;      // Inode pointer to swap file
+  char swap_filename[16];     // Swap file name (/pgswp00123)
+  int swap_slots[1024];       // Bitmap: 0=free, 1=used (max 1024 pages = 4MB)
   int num_swapped_pages;      // Number of swapped pages
-  int swap_fd;                // File descriptor for swap file
-  char swap_filename[32];     // Swap file name
 };

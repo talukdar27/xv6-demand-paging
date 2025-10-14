@@ -502,6 +502,181 @@ get_page_seq(struct proc *p, uint64 va)
   return -1; // Page not found in tracking table
 }
 
+// Find the oldest resident page (lowest sequence number) for FIFO replacement
+struct page_info*
+find_fifo_victim(struct proc *p)
+{
+  struct page_info *victim = 0;
+
+  for(int i = 0; i < MAX_TRACKED_PAGES; i++) {
+    if(p->page_table[i].va != 0 && p->page_table[i].swap_slot == -1) {
+      // Page is resident (not swapped out)
+      if(victim == 0 || p->page_table[i].seq < victim->seq) {
+        victim = &p->page_table[i];
+      }
+    }
+  }
+
+  if(victim) {
+    printf("[pid %d] VICTIM va=0x%lx seq=%d algo=FIFO\n",
+           p->pid, victim->va, victim->seq);
+  }
+
+  return victim;
+}
+
+// Allocate a free swap slot
+int
+alloc_swap_slot(struct proc *p)
+{
+  for(int i = 0; i < 1024; i++) {
+    if(p->swap_slots[i] == 0) {
+      p->swap_slots[i] = 1;  // Mark as used
+      return i;
+    }
+  }
+  return -1; // No free slots
+}
+
+// Real implementation of write_to_swap - writes page content to swap file
+int
+write_to_swap(struct proc *p, uint64 va)
+{
+  // Get physical address of the page
+  uint64 pa = walkaddr(p->pagetable, va);
+  if(pa == 0) {
+    return -1;
+  }
+
+  // Allocate a swap slot
+  int swap_slot = alloc_swap_slot(p);
+  if(swap_slot < 0) {
+    printf("write_to_swap: no free swap slots\n");
+    return -1;
+  }
+
+  // Write page to swap file at offset = swap_slot * PGSIZE
+  if(p->swap_ip == 0) {
+    printf("write_to_swap: no swap file\n");
+    p->swap_slots[swap_slot] = 0;  // Free the slot
+    return -1;
+  }
+
+  // Perform the write
+  ilock(p->swap_ip);
+  int bytes_written = writei(p->swap_ip, 0, pa, swap_slot * PGSIZE, PGSIZE);
+  iunlock(p->swap_ip);
+
+  if(bytes_written != PGSIZE) {
+    // Free the swap slot if write failed
+    p->swap_slots[swap_slot] = 0;
+    printf("write_to_swap: write failed, only wrote %d bytes\n", bytes_written);
+    return -1;
+  }
+
+  return swap_slot;
+}
+
+// Real implementation of read_from_swap - reads page content from swap file
+int
+read_from_swap(struct proc *p, uint64 va, int swap_slot)
+{
+  // Get physical address where we'll load the page
+  uint64 pa = walkaddr(p->pagetable, va);
+  if(pa == 0) {
+    return -1;
+  }
+
+  if(p->swap_ip == 0) {
+    printf("read_from_swap: no swap file\n");
+    return -1;
+  }
+
+  if(swap_slot < 0 || swap_slot >= 1024) {
+    printf("read_from_swap: invalid swap slot %d\n", swap_slot);
+    return -1;
+  }
+
+  // Read page from swap file
+  ilock(p->swap_ip);
+  int bytes_read = readi(p->swap_ip, 0, pa, swap_slot * PGSIZE, PGSIZE);
+  iunlock(p->swap_ip);
+
+  if(bytes_read != PGSIZE) {
+    printf("read_from_swap: read failed, only read %d bytes\n", bytes_read);
+    return -1;
+  }
+
+  return 0;
+}
+
+// Evict a page from memory
+int
+evict_page(struct proc *p, struct page_info *victim)
+{
+  uint64 va = victim->va;
+
+  // Check if page is dirty
+  int is_dirty = is_page_dirty(p, va);
+
+  printf("[pid %d] EVICT va=0x%lx state=%s\n",
+         p->pid, va, is_dirty ? "dirty" : "clean");
+
+  if(is_dirty) {
+    // Write dirty page to swap
+    int swap_slot = write_to_swap(p, va);
+    if(swap_slot < 0) {
+      printf("[pid %d] SWAPFULL\n", p->pid);
+      printf("[pid %d] KILL swap-exhausted\n", p->pid);
+      return -1;  // Will cause process termination
+    }
+    victim->swap_slot = swap_slot;
+    p->num_swapped_pages++;
+    printf("[pid %d] SWAPOUT va=0x%lx slot=%d\n", p->pid, va, swap_slot);
+  } else {
+    // Clean page - just discard, don't swap out
+    printf("[pid %d] DISCARD va=0x%lx\n", p->pid, va);
+    // victim->swap_slot remains -1 for clean pages
+  }
+
+  // Unmap the page from page table and free physical memory
+  pte_t *pte = walk(p->pagetable, va, 0);
+  if(pte && (*pte & PTE_V)) {
+    uint64 pa = PTE2PA(*pte);
+    kfree((void*)pa);  // Free the physical frame
+    *pte = 0;          // Clear PTE
+  }
+
+  // Update tracking
+  p->num_resident_pages--;
+
+  return 0;
+}
+
+// Find if a page is swapped out
+struct page_info*
+find_swapped_page(struct proc *p, uint64 va)
+{
+  for(int i = 0; i < MAX_TRACKED_PAGES; i++) {
+    if(p->page_table[i].va == va && p->page_table[i].swap_slot >= 0) {
+      return &p->page_table[i];
+    }
+  }
+  return 0;
+}
+
+// Free swap slot when page is loaded back
+void
+free_swap_slot(struct proc *p, int swap_slot)
+{
+  // In Phase 3: Mark swap slot as free in bitmap
+  // For now, just log
+  if(swap_slot >= 0 && swap_slot < 1024) {
+    p->swap_slots[swap_slot] = 0;  // Mark as free
+    printf("DEBUG: Freed swap slot %d\n", swap_slot);
+  }
+}
+
 // allocate and map user memory if process is referencing a page
 // that was lazily allocated in sys_sbrk() or exec().
 // returns 0 if va is invalid or already mapped, or if
@@ -539,12 +714,97 @@ vmfault(pagetable_t pagetable, uint64 va, int write_access)
     return 0;
   }
 
-  // Allocate physical page
+  // Check if this page is swapped out
+  struct page_info *swapped_page = find_swapped_page(p, va);
+  if(swapped_page && swapped_page->swap_slot >= 0) {
+    printf("swap\n");  // Complete PAGEFAULT cause
+
+    // Allocate physical memory
+    mem = (uint64) kalloc();
+    if(mem == 0) {
+      // Memory full - trigger page replacement
+      printf("[pid %d] MEMFULL\n", p->pid);
+
+      // Find FIFO victim
+      struct page_info *victim = find_fifo_victim(p);
+      if(victim == 0) {
+        printf("vmfault: no victim found during swap-in\n");
+        return 0;
+      }
+
+      // Evict the victim
+      if(evict_page(p, victim) != 0) {
+        printf("vmfault: eviction failed during swap-in\n");
+        return 0;
+      }
+
+      // Retry allocation after eviction
+      mem = (uint64) kalloc();
+      if(mem == 0) {
+        printf("vmfault: still no memory after eviction during swap-in\n");
+        return 0;
+      }
+    }
+
+    int old_slot = swapped_page->swap_slot;
+
+    // Map the page first so walkaddr can find it
+    if(mappages(p->pagetable, va, PGSIZE, mem, PTE_W|PTE_U|PTE_R) != 0) {
+      kfree((void*)mem);
+      return 0;
+    }
+
+    // Now read from swap into the mapped page
+    if(read_from_swap(p, va, old_slot) == 0) {
+      printf("[pid %d] SWAPIN va=0x%lx slot=%d\n", p->pid, va, old_slot);
+
+      // Update page info
+      swapped_page->swap_slot = -1;  // No longer swapped
+      swapped_page->seq = p->next_fifo_seq++;  // Update sequence
+      p->num_resident_pages++;
+      p->num_swapped_pages--;
+
+      // Free the swap slot
+      free_swap_slot(p, old_slot);
+
+      printf("[pid %d] RESIDENT va=0x%lx seq=%d\n", p->pid, va, swapped_page->seq);
+
+      return mem;
+    } else {
+      // Read failed - unmap and free
+      uvmunmap(p->pagetable, va, 1, 1);
+      printf("vmfault: read_from_swap failed\n");
+      return 0;
+    }
+  }
+
+  // Try to allocate physical page
   mem = (uint64) kalloc();
   if(mem == 0) {
-    printf("vmfault: out of physical memory\n");
-    return 0;
+    // Memory full - trigger page replacement
+    printf("[pid %d] MEMFULL\n", p->pid);
+
+    // Find FIFO victim
+    struct page_info *victim = find_fifo_victim(p);
+    if(victim == 0) {
+      printf("vmfault: no victim found\n");
+      return 0;
+    }
+
+    // Evict the victim
+    if(evict_page(p, victim) != 0) {
+      printf("vmfault: eviction failed\n");
+      return 0;
+    }
+
+    // Retry allocation after eviction
+    mem = (uint64) kalloc();
+    if(mem == 0) {
+      printf("vmfault: still no memory after eviction\n");
+      return 0;
+    }
   }
+
   memset((void *) mem, 0, PGSIZE);
 
   // Check if this page belongs to a program segment that needs to be loaded
@@ -684,9 +944,7 @@ ismapped(pagetable_t pagetable, uint64 va)
     return 0;
   }
   if (*pte & PTE_V){
-    return 1;
-  }
-  return 0;
+    return 1;  }  return 0;
 }
 
 // Check if a page is dirty
