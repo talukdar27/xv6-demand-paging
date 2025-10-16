@@ -84,15 +84,11 @@ usertrap(void)
 
     uint64 fault_va = r_stval();
 
-    // Print nning of the PAGEFAULT line
-    printf("[pid %d] PAGEFAULT va=0x%lx access=%s cause=",
-           p->pid, fault_va, access_type);
-
-    uint64 result = vmfault(p->pagetable, fault_va, (r_scause() == 15)? 1 : 0);
+    // vmfault will print the complete PAGEFAULT line
+    uint64 result = vmfault(p->pagetable, fault_va, is_write, access_type);
 
     if(result == 0) {
-      // vmfault failed - complete the log line with "invalid"
-      printf("invalid\n");
+      // vmfault failed - it already logged the PAGEFAULT line
       printf("usertrap(): unexpected scause 0x%lx pid=%d\n", r_scause(), p->pid);
       printf("            sepc=0x%lx stval=0x%lx\n", r_sepc(), r_stval());
       setkilled(p);

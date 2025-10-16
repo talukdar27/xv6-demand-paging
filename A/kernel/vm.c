@@ -351,7 +351,7 @@ copyout(pagetable_t pagetable, uint64 dstva, char *src, uint64 len)
 
     pa0 = walkaddr(pagetable, va0);
     if(pa0 == 0) {
-      if((pa0 = vmfault(pagetable, va0, 1)) == 0) {  // 1 = write access
+      if((pa0 = vmfault(pagetable, va0, 1, "write")) == 0) {  // 1 = write access
         return -1;
       }
     }
@@ -385,7 +385,7 @@ copyin(pagetable_t pagetable, char *dst, uint64 srcva, uint64 len)
     va0 = PGROUNDDOWN(srcva);
     pa0 = walkaddr(pagetable, va0);
     if(pa0 == 0) {
-      if((pa0 = vmfault(pagetable, va0, 0)) == 0) {  // 0 = read access
+      if((pa0 = vmfault(pagetable, va0, 0, "read")) == 0) {  // 0 = read access
         return -1;
       }
     }
@@ -610,6 +610,31 @@ read_from_swap(struct proc *p, uint64 va, int swap_slot)
   return 0;
 }
 
+// Check if a clean page can be reloaded from the executable file
+int
+can_reload_from_exec(struct proc *p, uint64 va)
+{
+  if(p->ip == 0 || p->phnum == 0)
+    return 0;
+
+  for(int i = 0; i < p->phnum; i++) {
+    struct proghdr *ph = &p->ph[i];
+    uint64 seg_start = ph->vaddr;
+    uint64 seg_end = ph->memsz;
+
+    if(va >= seg_start && va < seg_end) {
+      uint64 offset_in_seg = va - seg_start;
+      // Can only reload if within filesz (has data in file)
+      if(offset_in_seg < ph->filesz) {
+        return 1;  // Can reload from executable file
+      }
+      // In BSS or beyond filesz - cannot reload
+      return 0;
+    }
+  }
+  return 0;  // Not in any executable segment
+}
+
 // Evict a page from memory
 int
 evict_page(struct proc *p, struct page_info *victim)
@@ -623,20 +648,38 @@ evict_page(struct proc *p, struct page_info *victim)
          p->pid, va, is_dirty ? "dirty" : "clean");
 
   if(is_dirty) {
-    // Write dirty page to swap
+    // CASE 1: Dirty page - ALWAYS swap out (modified data must be saved)
     int swap_slot = write_to_swap(p, va);
     if(swap_slot < 0) {
       printf("[pid %d] SWAPFULL\n", p->pid);
       printf("[pid %d] KILL swap-exhausted\n", p->pid);
+      setkilled(p);
       return -1;  // Will cause process termination
     }
     victim->swap_slot = swap_slot;
     p->num_swapped_pages++;
     printf("[pid %d] SWAPOUT va=0x%lx slot=%d\n", p->pid, va, swap_slot);
   } else {
-    // Clean page - just discard, don't swap out
-    printf("[pid %d] DISCARD va=0x%lx\n", p->pid, va);
-    // victim->swap_slot remains -1 for clean pages
+    // CASE 2: Clean page - check backing store
+    if(can_reload_from_exec(p, va)) {
+      // CASE 2a: Text/data segment with file data - just DISCARD
+      // Can be reloaded from executable file later
+      printf("[pid %d] DISCARD va=0x%lx\n", p->pid, va);
+      victim->swap_slot = -1;  // Mark as discarded, not swapped
+    } else {
+      // CASE 2b: BSS/heap/stack - must SWAPOUT even if clean
+      // Cannot reload from anywhere else, so save to swap
+      int swap_slot = write_to_swap(p, va);
+      if(swap_slot < 0) {
+        printf("[pid %d] SWAPFULL\n", p->pid);
+        printf("[pid %d] KILL swap-exhausted\n", p->pid);
+        setkilled(p);
+        return -1;
+      }
+      victim->swap_slot = swap_slot;
+      p->num_swapped_pages++;
+      printf("[pid %d] SWAPOUT va=0x%lx slot=%d\n", p->pid, va, swap_slot);
+    }
   }
 
   // Unmap the page from page table and free physical memory
@@ -669,11 +712,8 @@ find_swapped_page(struct proc *p, uint64 va)
 void
 free_swap_slot(struct proc *p, int swap_slot)
 {
-  // In Phase 3: Mark swap slot as free in bitmap
-  // For now, just log
   if(swap_slot >= 0 && swap_slot < 1024) {
     p->swap_slots[swap_slot] = 0;  // Mark as free
-    printf("DEBUG: Freed swap slot %d\n", swap_slot);
   }
 }
 
@@ -682,15 +722,20 @@ free_swap_slot(struct proc *p, int swap_slot)
 // returns 0 if va is invalid or already mapped, or if
 // out of physical memory, and physical address if successful.
 uint64
-vmfault(pagetable_t pagetable, uint64 va, int write_access)
+vmfault(pagetable_t pagetable, uint64 va, int write_access, char *access_type)
 {
   uint64 mem;
   struct proc *p = myproc();
   int i;
   struct page_info *pinfo;
 
+  // Early bounds check
   if (va >= p->sz) {
-    printf("vmfault: va 0x%lx >= process size 0x%lx (out of bounds)\n", va, p->sz);
+    printf("[pid %d] PAGEFAULT va=0x%lx access=%s cause=invalid\n",
+           p->pid, va, access_type);
+    printf("[pid %d] KILL invalid-access va=0x%lx access=%s\n",
+           p->pid, va, access_type);
+    setkilled(p);
     return 0;
   }
 
@@ -710,15 +755,114 @@ vmfault(pagetable_t pagetable, uint64 va, int write_access)
       }
       return pa;
     }
-    printf("vmfault: va 0x%lx marked as mapped but walkaddr failed\n", va);
+    printf("[pid %d] PAGEFAULT va=0x%lx access=%s cause=invalid\n",
+           p->pid, va, access_type);
+    printf("[pid %d] KILL invalid-access va=0x%lx access=%s\n",
+           p->pid, va, access_type);
+    setkilled(p);
     return 0;
   }
 
-  // Check if this page is swapped out
+  // ===================================================================
+  // STEP 1: CLASSIFY - Determine what type of page this is
+  // ===================================================================
+
+  int is_swapped = 0;
+  int is_exec_segment = 0;
+  int is_stack = 0;
+  int is_heap = 0;
+
+  // 1. Check if page is swapped out
   struct page_info *swapped_page = find_swapped_page(p, va);
   if(swapped_page && swapped_page->swap_slot >= 0) {
-    printf("swap\n");  // Complete PAGEFAULT cause
+    is_swapped = 1;
+  }
 
+  // 2. Check if page is part of an executable segment
+  if(p->ip != 0 && p->phnum > 0) {
+    for(i = 0; i < p->phnum; i++) {
+      struct proghdr *ph = &p->ph[i];
+      uint64 seg_start = ph->vaddr;
+      uint64 seg_end = ph->vaddr + ph->memsz;
+      if(va >= seg_start && va < seg_end) {
+        is_exec_segment = 1;
+        break;
+      }
+    }
+  }
+
+  // 3. Check if page is in stack region (STRICT: within one page of SP)
+  uint64 stack_bottom = p->sz - (USERSTACK+1)*PGSIZE;
+  uint64 current_sp = p->trapframe->sp;
+  uint64 sp_page = PGROUNDDOWN(current_sp);
+
+  if(va >= stack_bottom && va < p->sz) {
+    // Must be within one page below or at SP
+    if(va >= sp_page - PGSIZE && va < sp_page + PGSIZE) {
+      is_stack = 1;
+    }
+  }
+
+  // 4. Check if page is in heap region (below stack, not in executable)
+  uint64 heap_end = stack_bottom;
+  uint64 heap_start = 0;
+
+  if(p->ip != 0 && p->phnum > 0) {
+    for(i = 0; i < p->phnum; i++) {
+      struct proghdr *ph = &p->ph[i];
+      uint64 seg_end = ph->vaddr + ph->memsz;
+      if(seg_end > heap_start) {
+        heap_start = seg_end;
+      }
+    }
+    heap_start = PGROUNDUP(heap_start);
+  }
+
+  if(va >= heap_start && va < heap_end && !is_exec_segment) {
+    is_heap = 1;
+  }
+
+  // ===================================================================
+  // STEP 2: VALIDATE - Check if this is a valid access
+  // ===================================================================
+
+  int is_valid_access = (is_swapped || is_exec_segment || is_stack || is_heap);
+
+  // ===================================================================
+  // STEP 3: DETERMINE CAUSE - For logging (priority order)
+  // ===================================================================
+
+  char *cause;
+  if(is_swapped) {
+    cause = "swap";
+  } else if(is_exec_segment) {
+    cause = "exec";
+  } else if(is_stack) {
+    cause = "stack";
+  } else if(is_heap) {
+    cause = "heap";
+  } else {
+    cause = "invalid";
+  }
+
+  // Print COMPLETE PAGEFAULT line in ONE place
+  printf("[pid %d] PAGEFAULT va=0x%lx access=%s cause=%s\n",
+         p->pid, va, access_type, cause);
+
+  if(!is_valid_access) {
+    // INVALID ACCESS - terminate the process
+    printf("[pid %d] KILL invalid-access va=0x%lx access=%s\n",
+           p->pid, va, access_type);
+    setkilled(p);
+    return 0;
+  }
+
+  // ===================================================================
+  // STEP 4: HANDLE THE PAGE FAULT
+  // ===================================================================
+
+  // Handle swapped page
+  if(is_swapped) {
     // Allocate physical memory
     mem = (uint64) kalloc();
     if(mem == 0) {
@@ -807,16 +951,14 @@ vmfault(pagetable_t pagetable, uint64 va, int write_access)
 
   memset((void *) mem, 0, PGSIZE);
 
-  // Check if this page belongs to a program segment that needs to be loaded
-  if(p->ip != 0 && p->phnum > 0) {
+  // Handle executable segment
+  if(is_exec_segment) {
     for(i = 0; i < p->phnum; i++) {
       struct proghdr *ph = &p->ph[i];
       uint64 seg_start = ph->vaddr;
       uint64 seg_end = ph->vaddr + ph->memsz;
 
       if(va >= seg_start && va < seg_end) {
-        printf("exec\n");
-
         uint64 offset_in_seg = va - seg_start;
         uint64 file_offset = ph->off + offset_in_seg;
         uint64 bytes_to_read = PGSIZE;
@@ -870,70 +1012,64 @@ vmfault(pagetable_t pagetable, uint64 va, int write_access)
     }
   }
 
-  // Not a program segment - must be heap or stack
-  uint64 stack_bottom = p->sz - (USERSTACK+1)*PGSIZE;
-  uint64 current_sp = p->trapframe->sp;
+  // Handle stack
+  if(is_stack) {
+    printf("[pid %d] ALLOC va=0x%lx\n", p->pid, va);
 
-  if(va >= stack_bottom && va < p->sz) {
-    uint64 sp_page = PGROUNDDOWN(current_sp);
-
-    if(va >= sp_page - PGSIZE && va < sp_page + PGSIZE) {
-      printf("stack\n");
-      printf("[pid %d] ALLOC va=0x%lx\n", p->pid, va);
-
-      if (mappages(p->pagetable, va, PGSIZE, mem, PTE_W|PTE_U|PTE_R) != 0) {
-        kfree((void *)mem);
-        printf("vmfault: mappages failed for stack\n");
-        return 0;
-      }
-
-      clear_page_dirty(p, va);
-      p->num_resident_pages++;
-
-      // Add page info with sequence number
-      pinfo = add_page_info(p, va);
-      if(pinfo) {
-        // Mark dirty if this is a write access
-        if(write_access) {
-          mark_page_dirty(p, va);
-          pinfo->is_dirty = 1;
-        }
-        printf("[pid %d] RESIDENT va=0x%lx seq=%d\n", p->pid, va, pinfo->seq);
-      }
-
-      return mem;
-    } else {
+    if (mappages(p->pagetable, va, PGSIZE, mem, PTE_W|PTE_U|PTE_R) != 0) {
       kfree((void *)mem);
-      printf("vmfault: stack access at va 0x%lx not within one page of SP (0x%lx)\n", va, current_sp);
+      printf("vmfault: mappages failed for stack\n");
       return 0;
     }
-  }
 
-  // Must be heap
-  printf("heap\n");
-  printf("[pid %d] ALLOC va=0x%lx\n", p->pid, va);
+    clear_page_dirty(p, va);
+    p->num_resident_pages++;
 
-  if (mappages(p->pagetable, va, PGSIZE, mem, PTE_W|PTE_U|PTE_R) != 0) {
-    kfree((void *)mem);
-    printf("vmfault: mappages failed for heap\n");
-    return 0;
-  }
-
-  clear_page_dirty(p, va);
-  p->num_resident_pages++;
-
-  // Add page info with sequence number
-  pinfo = add_page_info(p, va);
-  if(pinfo) {
-    // Mark dirty if this is a write access
-    if(write_access) {
-      mark_page_dirty(p, va);
-      pinfo->is_dirty = 1;
+    // Add page info with sequence number
+    pinfo = add_page_info(p, va);
+    if(pinfo) {
+      // Mark dirty if this is a write access
+      if(write_access) {
+        mark_page_dirty(p, va);
+        pinfo->is_dirty = 1;
+      }
+      printf("[pid %d] RESIDENT va=0x%lx seq=%d\n", p->pid, va, pinfo->seq);
     }
-    printf("[pid %d] RESIDENT va=0x%lx seq=%d\n", p->pid, va, pinfo->seq);
+
+    return mem;
   }
 
-  return mem;
+  // Handle heap
+  if(is_heap) {
+    printf("[pid %d] ALLOC va=0x%lx\n", p->pid, va);
+
+    if (mappages(p->pagetable, va, PGSIZE, mem, PTE_W|PTE_U|PTE_R) != 0) {
+      kfree((void *)mem);
+      printf("vmfault: mappages failed for heap\n");
+      return 0;
+    }
+
+    clear_page_dirty(p, va);
+    p->num_resident_pages++;
+
+    // Add page info with sequence number
+    pinfo = add_page_info(p, va);
+    if(pinfo) {
+      // Mark dirty if this is a write access
+      if(write_access) {
+        mark_page_dirty(p, va);
+        pinfo->is_dirty = 1;
+      }
+      printf("[pid %d] RESIDENT va=0x%lx seq=%d\n", p->pid, va, pinfo->seq);
+    }
+
+    return mem;
+  }
+
+  // Should never reach here if validation worked correctly
+  kfree((void *)mem);
+  printf("vmfault: unexpected code path reached\n");
+  return 0;
 }
 
 int
@@ -944,7 +1080,9 @@ ismapped(pagetable_t pagetable, uint64 va)
     return 0;
   }
   if (*pte & PTE_V){
-    return 1;  }  return 0;
+    return 1;
+  }
+  return 0;
 }
 
 // Check if a page is dirty

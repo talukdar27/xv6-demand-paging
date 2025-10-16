@@ -170,7 +170,7 @@ int             copyout(pagetable_t, uint64, char *, uint64);
 int             copyin(pagetable_t, char *, uint64, uint64);
 int             copyinstr(pagetable_t, char *, uint64, uint64);
 int             ismapped(pagetable_t, uint64);
-uint64          vmfault(pagetable_t, uint64, int);
+uint64          vmfault(pagetable_t, uint64, int, char*);
 int             is_page_dirty(struct proc*, uint64);
 void            mark_page_dirty(struct proc*, uint64);
 void            clear_page_dirty(struct proc*, uint64);
@@ -185,6 +185,7 @@ int                 read_from_swap(struct proc*, uint64, int);
 struct page_info*   find_swapped_page(struct proc*, uint64);
 void                free_swap_slot(struct proc*, int);
 int                 alloc_swap_slot(struct proc*);
+int                 can_reload_from_exec(struct proc*, uint64);
 
 // plic.c
 void            plicinit(void);
