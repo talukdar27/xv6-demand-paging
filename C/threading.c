@@ -1,3 +1,5 @@
+//############LLM Compilation Begins #############
+
 #define _GNU_SOURCE
 #include <stdio.h>
 #include <stdlib.h>
@@ -94,6 +96,16 @@ static void log_msg(const char *fmt, ...) {
     printf("\n");
     fflush(stdout);
 }
+
+// Array to store customer data before simulation starts
+typedef struct {
+    int id;
+    int arrival_time;
+} customer_input_t;
+
+customer_input_t *customer_inputs = NULL;
+int num_customers = 0;
+int customer_capacity = 0;
 
 void *customer_thread(void *arg) {
     customer_t *c = (customer_t *)arg;
@@ -215,7 +227,6 @@ void *chef_thread(void *arg) {
     return NULL;
 }
 
-
 void spawn_customer(int cid, int arrival_sec) {
     customer_t *c = calloc(1, sizeof(customer_t));
     c->id = cid;
@@ -236,9 +247,7 @@ void spawn_customer(int cid, int arrival_sec) {
 }
 
 int main() {
-    time(&sim_start);
-    log_msg("Simulation starting.");
-
+    // Initialize data structures BEFORE starting simulation
     sem_init(&capacity_sem, 0, MAX_CAPACITY);
     sem_init(&sofa_sem, 0, SOFA_SEATS);
     sem_init(&cash_register, 0, 1);
@@ -247,6 +256,53 @@ int main() {
     queue_init(&standing_queue);
     queue_init(&payment_queue);
 
+    // Read ALL customer inputs BEFORE starting simulation
+    printf("Enter customer arrivals (format: timestamp Customer id)\n");
+    printf("Press Ctrl+D when done:\n");
+    fflush(stdout);
+
+    customer_capacity = 10;
+    customer_inputs = malloc(customer_capacity * sizeof(customer_input_t));
+    if (!customer_inputs) {
+        fprintf(stderr, "Failed to allocate memory for customer inputs\n");
+        exit(1);
+    }
+
+    char line[128];
+    while (fgets(line, sizeof(line), stdin)) {
+        // Skip empty lines and comments
+        if (line[0] == '\n' || line[0] == '#') continue;
+
+        int timestamp, cust_id;
+        if (sscanf(line, "%d Customer %d", &timestamp, &cust_id) == 2) {
+            // Grow array if needed
+            if (num_customers >= customer_capacity) {
+                customer_capacity *= 2;
+                customer_inputs = realloc(customer_inputs, customer_capacity * sizeof(customer_input_t));
+                if (!customer_inputs) {
+                    fprintf(stderr, "Failed to reallocate memory\n");
+                    exit(1);
+                }
+            }
+
+            // Store customer input
+            customer_inputs[num_customers].id = cust_id;
+            customer_inputs[num_customers].arrival_time = timestamp;
+            num_customers++;
+        } else {
+            printf("Invalid input line: %s", line);
+        }
+    }
+
+    printf("\nInput complete. %d customers entered.\n", num_customers);
+    printf("Starting simulation...\n\n");
+    fflush(stdout);
+
+    // NOW start the simulation clock
+    time(&sim_start);
+    log_msg("Simulation starting.");
+
+    // Spawn chef threads
     for (int i = 1; i <= NUM_CHEFS; ++i) {
         pthread_t tid;
         int *arg = malloc(sizeof(int));
@@ -259,27 +315,18 @@ int main() {
         pthread_detach(tid);
     }
 
-    FILE *fp = fopen("/home/user/Desktop/SEMESTER5/mini-project-2-talukdar27/C/input.txt", "r");
-    if (!fp) {
-        perror("Error opening input file");
-        exit(1);
+    // Spawn customer threads from collected input
+    for (int i = 0; i < num_customers; i++) {
+        spawn_customer(customer_inputs[i].id, customer_inputs[i].arrival_time);
     }
 
-    char line[128];
-    while (fgets(line, sizeof(line), fp)) {
-        if (line[0] == '\n' || line[0] == '#') continue;
+    // Free the input array
+    free(customer_inputs);
 
-        int timestamp, cust_id;
-        if (sscanf(line, "%d Customer %d", &timestamp, &cust_id) == 2) {
-            spawn_customer(cust_id, timestamp);
-        } else {
-            log_msg("Invalid input line: %s", line);
-        }
-    }
-
-    fclose(fp);
-
+    // Wait for all customers to complete
     sleep(60);
     log_msg("Simulation ending.");
     return 0;
 }
+
+//###########LLM Compilation Ends ##############
